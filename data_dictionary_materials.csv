@@ -1,0 +1,16 @@
+column,type,description
+date,date,Transaction week (Monday)
+year,int,Year
+month,int,Month (1-12)
+week_of_year,int,ISO week number
+region,string,"US census division (South_Atlantic, Pacific, Mountain, ...)"
+product_category,string,"lumber, concrete_cement, roofing, drywall, insulation, plumbing, electrical, windows_doors, hardware_fasteners, paint_coatings"
+sku,string,Synthetic SKU code
+channel,string,pro_dealer (contractor supply) or big_box_diy
+customer_type,string,homebuilder / contractor / remodeler / homeowner_diy
+units,int,Units sold in the transaction
+unit_price,float,Price per unit (USD) — lumber-sensitive categories reflect the price shock
+revenue,float,units * unit_price (USD)
+housing_starts_index,float,EXOGENOUS: housing starts index (~100 base) at the transaction week
+lumber_price_index,float,EXOGENOUS: lumber price index (USD/mbf-like) — the 2020-22 shock
+mortgage_rate,float,EXOGENOUS: prevailing 30y mortgage rate (%)
