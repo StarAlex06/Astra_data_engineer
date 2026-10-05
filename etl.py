@@ -1,8 +1,4 @@
-"""Load the building-materials CSV sources into a normalized SQLite warehouse.
-
-The loader is deliberately dependency-free: it uses Python's CSV, hashing and
-SQLite libraries, so it can run locally without a service or package install.
-"""
+"""Загружает CSV продаж и макропоказателей в SQLite."""
 
 from __future__ import annotations
 
@@ -14,7 +10,7 @@ import math
 import sqlite3
 from datetime import date
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 
 TRANSACTION_COLUMNS = (
@@ -32,7 +28,7 @@ MACRO_NUMERIC = {"housing_starts_index": float, "lumber_price_index": float, "mo
 
 
 def _as_num(value: str, converter: type) -> int | float:
-    """Parse a numeric value and reject NaN or infinity for floating point fields."""
+    """Преобразует значение в число и отклоняет NaN и бесконечность."""
     result = converter(value)
     if isinstance(result, float) and not math.isfinite(result):
         raise ValueError("must be a finite number")
@@ -40,7 +36,7 @@ def _as_num(value: str, converter: type) -> int | float:
 
 
 def _date(value: str) -> date:
-    """Parse an ISO date; transaction weeks and macro weeks must be Mondays."""
+    """Разбирает дату недели и проверяет, что это понедельник."""
     parsed = date.fromisoformat(value)
     if parsed.weekday() != 0:
         raise ValueError("week date must be a Monday")
@@ -48,13 +44,13 @@ def _date(value: str) -> date:
 
 
 def _hash(record: dict[str, Any]) -> str:
-    """Return a stable SHA-256 fingerprint for a normalized source record."""
+    """Возвращает стабильный SHA-256 хеш записи."""
     encoded = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _rows(path: Path, expected: Iterable[str], kind: str):
-    """Yield CSV rows with line numbers and reject files with unexpected headers."""
+def _rows(path: Path, expected: Iterable[str]) -> Iterator[tuple[int, dict[str, str]]]:
+    """Читает CSV построчно и проверяет заголовок."""
     with path.open("r", encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
         if tuple(reader.fieldnames or ()) != tuple(expected):
@@ -64,7 +60,7 @@ def _rows(path: Path, expected: Iterable[str], kind: str):
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
-    """Open SQLite with foreign keys enabled and create the warehouse schema."""
+    """Открывает SQLite, включает внешние ключи и создаёт таблицы."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys = ON")
@@ -94,7 +90,7 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 
 
 def _validate_transaction(row: dict[str, str]) -> dict[str, Any]:
-    """Validate required fields, types, business ranges and internal arithmetic."""
+    """Проверяет поля продажи, их типы, диапазоны и расчёт выручки."""
     result: dict[str, Any] = dict(row)
     result["date"] = _date(row["date"]).isoformat()
     for name, converter in NUMERIC_COLUMNS.items():
@@ -104,7 +100,7 @@ def _validate_transaction(row: dict[str, str]) -> dict[str, Any]:
             raise ValueError(f"{name} is required")
         result[name] = row[name].strip()
     dt = date.fromisoformat(result["date"])
-    iso_year, iso_week, _ = dt.isocalendar()
+    iso_week = dt.isocalendar().week
     checks = (
         (result["year"] == dt.year, "year does not match date"),
         (result["month"] == dt.month, "month does not match date"),
@@ -124,7 +120,7 @@ def _validate_transaction(row: dict[str, str]) -> dict[str, Any]:
 
 
 def _validate_macro(row: dict[str, str]) -> dict[str, Any]:
-    """Validate the weekly macro driver record and its numeric ranges."""
+    """Проверяет дату и значения недельных макропоказателей."""
     result: dict[str, Any] = {"week": _date(row["week"]).isoformat()}
     for name, converter in MACRO_NUMERIC.items():
         result[name] = _as_num(row[name], converter)
@@ -134,22 +130,20 @@ def _validate_macro(row: dict[str, str]) -> dict[str, Any]:
 
 
 def _reject(conn: sqlite3.Connection, source: str, line: int, row: dict[str, str], reason: str) -> None:
-    """Persist a bad row and its actionable validation reason without stopping the batch."""
+    """Сохраняет некорректную строку и причину отказа."""
     conn.execute("INSERT OR IGNORE INTO rejected_rows(source_file,source_line,record_json,error_reason) VALUES(?,?,?,?)",
                  (source, line, json.dumps(row, ensure_ascii=False, sort_keys=True), reason))
 
 
 def load_transactions(conn: sqlite3.Connection, path: Path) -> tuple[int, int]:
-    """Validate and upsert transactions; return (accepted rows, rejected rows)."""
+    """Проверяет продажи и загружает их; возвращает числа принятых и отклонённых строк."""
     accepted = rejected = 0
-    for line_no, raw in _rows(path, TRANSACTION_COLUMNS, "transactions"):
+    for line_no, raw in _rows(path, TRANSACTION_COLUMNS):
         try:
             row = _validate_transaction(raw)
         except (ValueError, TypeError, KeyError) as exc:
             _reject(conn, path.name, line_no, raw, str(exc)); rejected += 1; continue
-        # No transaction ID is supplied. File name + stable CSV line number
-        # distinguishes same-grain events and lets a corrected line overwrite
-        # its prior version on the next run.
+        # В источнике нет ID сделки: имя файла и номер строки различают записи.
         key = _hash({"source_file": path.name, "source_line": line_no})
         conn.execute("INSERT INTO dim_date VALUES(?,?,?,?) ON CONFLICT(date_key) DO UPDATE SET year=excluded.year,month=excluded.month,week_of_year=excluded.week_of_year",
                      (row["date"], row["year"], row["month"], row["week_of_year"]))
@@ -170,9 +164,9 @@ def load_transactions(conn: sqlite3.Connection, path: Path) -> tuple[int, int]:
 
 
 def load_macro(conn: sqlite3.Connection, path: Path) -> tuple[int, int]:
-    """Validate and upsert weekly macro rows; return (accepted rows, rejected rows)."""
+    """Проверяет макроданные и загружает их по неделе."""
     accepted = rejected = 0
-    for line_no, raw in _rows(path, MACRO_COLUMNS, "macro"):
+    for line_no, raw in _rows(path, MACRO_COLUMNS):
         try:
             row = _validate_macro(raw)
             if conn.execute("SELECT 1 FROM dim_date WHERE date_key=?", (row["week"],)).fetchone() is None:
@@ -188,7 +182,7 @@ def load_macro(conn: sqlite3.Connection, path: Path) -> tuple[int, int]:
 
 
 def run_pipeline(transactions: Path, macro: Path, database: Path) -> dict[str, int]:
-    """Run extraction, validation, dimensional loading and facts in one atomic transaction."""
+    """Запускает загрузку обоих источников в одной транзакции."""
     conn = _connect(database)
     try:
         with conn:
@@ -203,7 +197,7 @@ def run_pipeline(transactions: Path, macro: Path, database: Path) -> dict[str, i
 
 
 def main() -> None:
-    """Parse command-line paths, execute ETL and print a compact JSON summary."""
+    """Разбирает параметры командной строки и запускает ETL."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--transactions", type=Path, default=Path("building_materials_transactions.csv"))
     parser.add_argument("--macro", type=Path, default=Path("macro_drivers_weekly.csv"))
